@@ -477,6 +477,7 @@ class MIoTLan:
 
     _lan_state_sub_map: dict[str, Callable[[bool], Coroutine]]
     _lan_ctrl_vote_map: dict[str, bool]
+    _allow_central_hub_coexist: dict[str, bool]
 
     _profile_models: dict[str, dict]
 
@@ -536,6 +537,7 @@ class MIoTLan:
 
         self._lan_state_sub_map = {}
         self._lan_ctrl_vote_map = {}
+        self._allow_central_hub_coexist = {}
 
         self._init_lock = asyncio.Lock()
         self._init_done = False
@@ -580,8 +582,11 @@ class MIoTLan:
                 _LOGGER.info('no vote for lan ctrl')
                 return
             if len(self._mips_service.get_services()) > 0:
-                _LOGGER.info('central hub gateway service exist')
-                return
+                if not any(self._allow_central_hub_coexist.values()):
+                    _LOGGER.info('central hub gateway service exist')
+                    return
+                _LOGGER.info(
+                    'central hub exists, but LAN coexist mode active')
             for if_name in list(self._network.network_info.keys()):
                 self._available_net_ifs.add(if_name)
             if len(self._available_net_ifs) == 0:
@@ -675,6 +680,15 @@ class MIoTLan:
             await self.deinit_async()
             return
         await self.init_async()
+
+    async def set_allow_central_hub_coexist(
+        self, key: str, allow: bool
+    ) -> None:
+        _LOGGER.info(
+            'set allow central hub coexist, %s, %s', key, allow)
+        self._allow_central_hub_coexist[key] = allow
+        if allow and not self._init_done:
+            await self.init_async()
 
     async def update_subscribe_option(self, enable_subscribe: bool) -> None:
         _LOGGER.info('update subscribe option, %s', enable_subscribe)
@@ -941,8 +955,15 @@ class MIoTLan:
         _LOGGER.info(
             'on mips service change, %s, %s, %s',  group_id, state, data)
         if len(self._mips_service.get_services()) > 0:
-            _LOGGER.info('find central service, deinit miot lan')
-            await self.deinit_async()
+            if any(self._allow_central_hub_coexist.values()):
+                _LOGGER.info(
+                    'find central service, but LAN coexist mode active, '
+                    'keeping miot lan alive')
+                if not self._init_done:
+                    await self.init_async()
+            else:
+                _LOGGER.info('find central service, deinit miot lan')
+                await self.deinit_async()
         else:
             _LOGGER.info('no central service, init miot lan')
             await self.init_async()
