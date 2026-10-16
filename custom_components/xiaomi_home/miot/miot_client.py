@@ -66,7 +66,7 @@ from .const import (
     OAUTH2_CLIENT_ID, SUPPORT_CENTRAL_GATEWAY_CTRL,
     DEFAULT_COVER_DEAD_ZONE_WIDTH)
 from .miot_cloud import MIoTHttpClient, MIoTOauthClient
-from .miot_error import MIoTClientError, MIoTErrorCode
+from .miot_error import MIoTClientError, MIoTErrorCode, MIoTMipsError
 from .miot_mips import (
     MIoTDeviceState, MipsCloudClient, MipsDeviceState,
     MipsLocalClient)
@@ -141,6 +141,11 @@ class MIoTClient:
 
     # Multi local mips client, key=group_id
     _mips_local: dict[str, MipsLocalClient]
+    # Pending gateway service data for failover, key=group_id.
+    # When a different gateway advertises the same group_id while the current
+    # connection is healthy, we store its data here instead of switching
+    # immediately. On disconnect, we try this alternative first.
+    _mips_local_pending: dict[str, dict]
     # Cloud mips client
     _mips_cloud: MipsCloudClient
     # MIoT lan client
@@ -221,6 +226,7 @@ class MIoTClient:
         self._user_config = None
 
         self._mips_local = {}
+        self._mips_local_pending = {}
         self._mips_cloud = None
         self._miot_lan = miot_lan
 
@@ -253,6 +259,16 @@ class MIoTClient:
             'display_binary_mode', ['text'])
         self._display_binary_bool = 'bool' in entry_data.get(
             'display_binary_mode', ['text'])
+        self._wifi_lan_ctrl_fallback = entry_data.get(
+            'wifi_lan_ctrl_fallback', False)
+
+        self._mqtt_debug_log: list[str] = []
+        self._mqtt_debug_max_entries: int = 0
+
+        # Force gateway address override (set to None to use mDNS discovery)
+        self._force_gateway_host: Optional[str] = None
+        # One-shot: force cert renewal on next startup (set False after done)
+        self._force_cert_renew: bool = False
 
     async def init_async(self) -> None:
         # Load user config and check
@@ -339,10 +355,17 @@ class MIoTClient:
                     _LOGGER.info(
                         'central mips service scanned, %s, %s',
                         home_id, service_data)
+                    gw_host = (
+                        self._force_gateway_host
+                        or service_data['addresses'][0])
+                    _LOGGER.info(
+                        'gateway host selected: %s (forced=%s, mdns=%s)',
+                        gw_host, self._force_gateway_host,
+                        service_data['addresses'][0])
                     mips = MipsLocalClient(
                         did=self._entry_data['virtual_did'],
                         group_id=info['group_id'],
-                        host=service_data['addresses'][0],
+                        host=gw_host,
                         ca_file=self._cert.ca_file,
                         cert_file=self._cert.cert_file,
                         key_file=self._cert.key_file,
@@ -352,11 +375,15 @@ class MIoTClient:
                     self._mips_local[info['group_id']] = mips
                     mips.enable_logger(logger=_LOGGER)
                     mips.on_dev_list_changed = self.__on_gw_device_list_changed
+                    mips.on_mqtt_debug = self.__on_mqtt_debug_event
                     mips.sub_mips_state(
                         key=info['group_id'],
                         handler=self.__on_mips_local_state_changed)
                     mips.connect()
             # Lan ctrl
+            if self._wifi_lan_ctrl_fallback:
+                await self._miot_lan.set_allow_central_hub_coexist(
+                    key=f'{self._uid}-{self._cloud_server}', allow=True)
             await self._miot_lan.vote_for_lan_ctrl_async(
                 key=f'{self._uid}-{self._cloud_server}', vote=True)
             self._miot_lan.sub_lan_state(
@@ -376,6 +403,20 @@ class MIoTClient:
                 key=f'{self._uid}-{self._cloud_server}', vote=False)
 
         _LOGGER.info('init_async, %s, %s', self._uid, self._cloud_server)
+
+        if self._force_cert_renew:
+            _LOGGER.warning(
+                'init_async: force_cert_renew is ON, scheduling '
+                'cert renewal in 10s...')
+            self._main_loop.call_later(
+                10,
+                lambda: self._main_loop.create_task(
+                    self.__do_force_cert_renew()))
+
+    async def __do_force_cert_renew(self) -> None:
+        _LOGGER.warning('__do_force_cert_renew: executing...')
+        result = await self.force_renew_cert_and_reconnect_async()
+        _LOGGER.warning('__do_force_cert_renew: result=%s', result)
 
     async def deinit_async(self) -> None:
         self._network.unsub_network_status(
@@ -403,6 +444,7 @@ class MIoTClient:
                     mips.on_dev_list_changed = None
                     mips.unsub_mips_state(key=mips.group_id)
                     mips.deinit()
+                self._mips_local_pending.clear()
                 if self._mips_local_state_changed_timers:
                     for timer_item in (
                             self._mips_local_state_changed_timers.values()):
@@ -417,6 +459,8 @@ class MIoTClient:
                     devices=list(self._device_list_cache.keys()))
             await self._miot_lan.vote_for_lan_ctrl_async(
                 key=f'{self._uid}-{self._cloud_server}', vote=False)
+            await self._miot_lan.set_allow_central_hub_coexist(
+                key=f'{self._uid}-{self._cloud_server}', allow=False)
         # Cancel refresh auth info
         if self._refresh_token_timer:
             self._refresh_token_timer.cancel()
@@ -441,6 +485,9 @@ class MIoTClient:
             message=None, notify_key='device_cache')
         self.__show_client_error_notify(
             message=None, notify_key='device_cloud')
+        self._persistence_notify(
+            self.__gen_notify_key('mqtt_debug'), None, None)
+        self._mqtt_debug_log.clear()
 
         _LOGGER.info('deinit_async, %s', self._uid)
 
@@ -639,6 +686,100 @@ class MIoTClient:
                 'refresh user cert error, %s, %s',
                 error, traceback.format_exc())
         return False
+
+    async def force_renew_cert_and_reconnect_async(self) -> bool:
+        """Delete existing cert+key, regenerate, re-request from cloud,
+        then disconnect and reconnect all local MIPS gateways."""
+        _LOGGER.warning(
+            'force_renew_cert_and_reconnect: starting, uid=%s, did=%s',
+            self._uid, self._entry_data.get('virtual_did'))
+        try:
+            if self._cloud_server not in SUPPORT_CENTRAL_GATEWAY_CTRL:
+                _LOGGER.warning('force_renew: central gw not supported')
+                return False
+            # 1. Remove old cert and key
+            await self._cert.remove_user_cert_async()
+            await self._cert.remove_user_key_async()
+            _LOGGER.info('force_renew: removed old cert and key')
+            # 2. Verify CA cert
+            if not await self._cert.verify_ca_cert_async():
+                raise MIoTClientError('ca cert is not ready')
+            # 3. Generate new key
+            new_key = self._cert.gen_user_key()
+            if not await self._cert.update_user_key_async(key=new_key):
+                raise MIoTClientError('update_user_key_async failed')
+            _LOGGER.info('force_renew: generated new key')
+            # 4. Generate CSR and request new cert from cloud
+            csr_str = self._cert.gen_user_csr(
+                user_key=new_key, did=self._entry_data['virtual_did'])
+            crt_str = await self.miot_http.get_central_cert_async(csr_str)
+            if not crt_str:
+                raise MIoTClientError('get_central_cert_async returned empty')
+            if not await self._cert.update_user_cert_async(cert=crt_str):
+                raise MIoTClientError('update_user_cert_async failed')
+            _LOGGER.info('force_renew: new cert saved')
+            # 5. Disconnect all local MIPS gateways
+            for gid, mips in list(self._mips_local.items()):
+                _LOGGER.info('force_renew: disconnecting gateway %s', gid)
+                mips.on_dev_list_changed = None
+                mips.unsub_mips_state(key=gid)
+                await self._main_loop.run_in_executor(None, mips.disconnect)
+            self._mips_local.clear()
+            self._mips_local_pending.clear()
+            _LOGGER.info('force_renew: all gateways disconnected')
+            # 6. Re-create connections using new cert
+            for home_id, info in self._entry_data['home_selected'].items():
+                service_data = self._mips_service.get_services(
+                    group_id=info['group_id']).get(info['group_id'], None)
+                if not service_data:
+                    _LOGGER.info(
+                        'force_renew: no mDNS for %s, will connect on '
+                        'discovery', home_id)
+                    continue
+                gw_host = (
+                    self._force_gateway_host
+                    or service_data['addresses'][0])
+                _LOGGER.info(
+                    'force_renew: reconnecting to %s:%s (group=%s)',
+                    gw_host, service_data['port'], info['group_id'])
+                mips = MipsLocalClient(
+                    did=self._entry_data['virtual_did'],
+                    group_id=info['group_id'],
+                    host=gw_host,
+                    ca_file=self._cert.ca_file,
+                    cert_file=self._cert.cert_file,
+                    key_file=self._cert.key_file,
+                    port=service_data['port'],
+                    home_name=info['home_name'],
+                    loop=self._main_loop)
+                self._mips_local[info['group_id']] = mips
+                mips.enable_logger(logger=_LOGGER)
+                mips.on_dev_list_changed = self.__on_gw_device_list_changed
+                mips.on_mqtt_debug = self.__on_mqtt_debug_event
+                mips.sub_mips_state(
+                    key=info['group_id'],
+                    handler=self.__on_mips_local_state_changed)
+                mips.connect()
+            # 7. Schedule normal cert refresh
+            refresh_time = (
+                await self._cert.user_cert_remaining_time_async() -
+                MIHOME_CERT_EXPIRE_MARGIN)
+            if refresh_time > 0:
+                self.__request_refresh_user_cert(refresh_time)
+            self.__on_mqtt_debug_event(
+                '', f'`{time.strftime("%H:%M:%S")}` '
+                f'**🔄 CERT RENEWED** new cert applied, '
+                f'reconnecting gateways...')
+            _LOGGER.warning('force_renew_cert_and_reconnect: SUCCESS')
+            return True
+        except Exception as err:
+            _LOGGER.error(
+                'force_renew_cert_and_reconnect failed: %s, %s',
+                err, traceback.format_exc())
+            self.__on_mqtt_debug_event(
+                '', f'`{time.strftime("%H:%M:%S")}` '
+                f'**❌ CERT RENEW FAILED** {err}')
+            return False
 
     async def set_prop_async(
         self, did: str, siid: int, piid: int, value: Any
@@ -1059,26 +1200,52 @@ class MIoTClient:
 
         mips = self._mips_local.get(group_id, None)
         if mips:
-            # if state == MipsServiceState.REMOVED:
-            #     mips.disconnect()
-            #     self._mips_local.pop(group_id, None)
-            #     return
-            if ( # ADDED or UPDATED
+            effective_host = self._force_gateway_host or data['addresses'][0]
+            if (
                 mips.client_id == self._entry_data['virtual_did']
-                and mips.host == data['addresses'][0]
+                and mips.host == effective_host
                 and mips.port == data['port']
             ):
+                self._mips_local_pending.pop(group_id, None)
                 return
-            mips.disconnect()
+            if mips.mips_state:
+                # Current gateway connection is healthy. Don't disrupt it just
+                # because a different gateway (e.g. backup) advertised via
+                # mDNS. Store the alternative for failover on disconnect.
+                _LOGGER.info(
+                    'mips service updated but current connection is active, '
+                    'storing as pending failover, %s, %s -> %s',
+                    group_id, mips.host, data['addresses'][0])
+                self._mips_local_pending[group_id] = data
+                return
+            # Current connection is broken — proceed to switch gateway.
+            # Unsubscribe state handler and clear callback BEFORE disconnect
+            # to prevent the old mips's disconnect notification from being
+            # processed after the new mips is created (race condition that
+            # would incorrectly mark all gateway devices as offline).
+            mips.on_dev_list_changed = None
+            mips.unsub_mips_state(key=group_id)
             self._mips_local.pop(group_id, None)
+            await self._main_loop.run_in_executor(None, mips.disconnect)
+            # Another mDNS event may have created a new mips during the await
+            if group_id in self._mips_local:
+                _LOGGER.info(
+                    'gateway already reconnected during disconnect, %s',
+                    group_id)
+                return
+        self._mips_local_pending.pop(group_id, None)
         home_name: str = ''
         for info in list(self._entry_data['home_selected'].values()):
             if info.get('group_id', None) == group_id:
                 home_name = info.get('home_name', '')
+        gw_host = self._force_gateway_host or data['addresses'][0]
+        _LOGGER.info(
+            'gateway host selected: %s (forced=%s, mdns=%s)',
+            gw_host, self._force_gateway_host, data['addresses'][0])
         mips = MipsLocalClient(
             did=self._entry_data['virtual_did'],
             group_id=group_id,
-            host=data['addresses'][0],
+            host=gw_host,
             ca_file=self._cert.ca_file,
             cert_file=self._cert.cert_file,
             key_file=self._cert.key_file,
@@ -1088,6 +1255,7 @@ class MIoTClient:
         self._mips_local[group_id] = mips
         mips.enable_logger(logger=_LOGGER)
         mips.on_dev_list_changed = self.__on_gw_device_list_changed
+        mips.on_mqtt_debug = self.__on_mqtt_debug_event
         mips.sub_mips_state(
             key=group_id, handler=self.__on_mips_local_state_changed)
         mips.connect()
@@ -1139,26 +1307,40 @@ class MIoTClient:
         if not mips:
             _LOGGER.info(
                 'local mips state changed, mips not exist, %s', group_id)
-            # The connection to the central hub gateway is definitely broken.
-            self.__show_central_state_changed_notify(False)
+            self.__show_central_state_changed_notify(
+                False, event_group_id=group_id)
             return
         if state:
             # Connected
+            self._mips_local_pending.pop(group_id, None)
             self.__request_refresh_gw_devices_by_group_id(group_id=group_id)
+            self.__show_central_state_changed_notify(
+                True, event_group_id=group_id)
         else:
-            # Disconnect
+            # Disconnect — check if we have a pending alternative gateway
+            pending_data = self._mips_local_pending.pop(group_id, None)
+            if pending_data:
+                failover_addr = (
+                    f'{pending_data["addresses"][0]}:{pending_data["port"]}')
+                _LOGGER.info(
+                    'gateway disconnected, switching to pending failover '
+                    'gateway, %s, %s', group_id, failover_addr)
+                self.__show_central_state_changed_notify(
+                    False, event_group_id=group_id,
+                    failover_target=failover_addr)
+                self._main_loop.create_task(
+                    self.__on_mips_service_state_change(
+                        group_id, MipsServiceState.UPDATED, pending_data))
+                return
+            # No alternative — mark devices offline
             for did, info in self._device_list_gateway.items():
                 if info.get('group_id', None) != group_id:
-                    # Not belong to this gateway
                     continue
                 if not info.get('online', False):
-                    # Device offline, no need to update
                     continue
-                # Update local device info
                 info['online'] = False
                 info['push_available'] = False
                 if did not in self._device_list_cache:
-                    # Device not exist
                     continue
                 self.__update_device_msg_sub(did=did)
                 state_old: Optional[bool] = self._device_list_cache.get(
@@ -1174,7 +1356,8 @@ class MIoTClient:
                 if sub and sub.handler:
                     sub.handler(did, MIoTDeviceState.OFFLINE, sub.handler_ctx)
             self.__request_show_devices_changed_notify()
-        self.__show_central_state_changed_notify(state)
+            self.__show_central_state_changed_notify(
+                False, event_group_id=group_id)
 
     @final
     async def __on_miot_lan_state_change(self, state: bool) -> None:
@@ -1200,6 +1383,7 @@ class MIoTClient:
                 if 'token' in info and 'connect_type' in info
                 and info['connect_type'] in [0, 8, 12, 23]
             })
+            self.__show_central_state_changed_notify(connected=True)
         else:
             for did, info in self._device_list_lan.items():
                 if not info.get('online', False):
@@ -1270,8 +1454,13 @@ class MIoTClient:
                 'online', 'specV2Access', 'pushAvailable'
             ]
         }
-        gw_list = await mips.get_dev_list_async(
-            payload=json.dumps(payload))
+        try:
+            gw_list = await mips.get_dev_list_async(
+                payload=json.dumps(payload))
+        except MIoTMipsError as e:
+            _LOGGER.error(
+                'local mips get_dev_list_async exception, %s, %s', did_list, e)
+            gw_list = None
         if gw_list is None:
             _LOGGER.error('local mips get_dev_list_async failed, %s', did_list)
             return
@@ -1492,6 +1681,7 @@ class MIoTClient:
             })
 
         self.__request_show_devices_changed_notify()
+        self.__show_central_state_changed_notify(connected=True)
 
     @final
     async def __refresh_cloud_device_with_dids_async(
@@ -1611,13 +1801,18 @@ class MIoTClient:
                 'online', 'specV2Access', 'pushAvailable'
             ]
         }
-        gw_list: dict = await mips.get_dev_list_async(
-            payload=json.dumps(payload))
+        try:
+            gw_list: dict = await mips.get_dev_list_async(
+                payload=json.dumps(payload))
+        except MIoTMipsError as e:
+            _LOGGER.error(
+                'refresh gw devices with group_id exception, %s, %s, %s',
+                self._uid, group_id, e)
+            gw_list = None
         if gw_list is None:
             _LOGGER.error(
                 'refresh gw devices with group_id failed, %s, %s',
                 self._uid, group_id)
-            # Retry until success
             self.__request_refresh_gw_devices_by_group_id(
                 group_id=group_id)
             return
@@ -1626,6 +1821,8 @@ class MIoTClient:
                 did for did, info in self._device_list_gateway.items()
                 if info.get('group_id', None) == group_id])
         self.__request_show_devices_changed_notify()
+        self.__show_central_state_changed_notify(
+            connected=True, event_group_id=group_id)
 
     @final
     def __request_refresh_gw_devices_by_group_id(
@@ -1643,6 +1840,7 @@ class MIoTClient:
                     0, lambda: self._main_loop.create_task(
                         self.__refresh_gw_devices_with_group_id_async(
                             group_id=group_id))))
+            return
         if refresh_timer:
             return
         self._mips_local_state_changed_timers[group_id] = (
@@ -1965,23 +2163,218 @@ class MIoTClient:
         self._show_devices_changed_notify_timer = self._main_loop.call_later(
             delay_sec, self.__show_devices_changed_notify)
 
+    MQTT_RC_DESCRIPTIONS: dict[int, str] = {
+        0: 'Normal disconnection',
+        1: 'MQTT_ERR_NOMEM',
+        2: 'MQTT_ERR_PROTOCOL',
+        3: 'MQTT_ERR_INVAL',
+        4: 'MQTT_ERR_NO_CONN',
+        5: 'MQTT_ERR_CONN_REFUSED',
+        6: 'MQTT_ERR_NOT_FOUND',
+        7: 'MQTT_ERR_CONN_LOST - Connection lost',
+        8: 'MQTT_ERR_TLS - TLS error',
+        9: 'MQTT_ERR_PAYLOAD_SIZE',
+        10: 'MQTT_ERR_NOT_SUPPORTED',
+        11: 'MQTT_ERR_AUTH - Authentication failed',
+        12: 'MQTT_ERR_ACL_DENIED',
+        13: 'MQTT_ERR_UNKNOWN',
+        14: 'MQTT_ERR_ERRNO',
+        15: 'MQTT_ERR_QUEUE_SIZE',
+        16: 'MQTT_ERR_KEEPALIVE - Heartbeat timeout, gateway not responding',
+    }
+
     @final
-    def __show_central_state_changed_notify(self, connected: bool) -> None:
-        conn_status: str = (
-            self._i18n.translate('miot.client.central_state_connected')
-            if connected else
-            self._i18n.translate('miot.client.central_state_disconnected'))
+    def __on_mqtt_debug_event(
+        self, group_id: str, message: str
+    ) -> None:
+        if self._mqtt_debug_max_entries <= 0:
+            return
+        self._mqtt_debug_log.append(message)
+        if len(self._mqtt_debug_log) > self._mqtt_debug_max_entries:
+            self._mqtt_debug_log = self._mqtt_debug_log[
+                -self._mqtt_debug_max_entries:]
+        self.__show_mqtt_debug_notify()
+
+    @final
+    def __show_mqtt_debug_notify(self) -> None:
+        if not self._mqtt_debug_log or not self._persistence_notify:
+            return
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        lines: list[str] = []
+        lines.append(
+            f'**MQTT Gateway Debug Log** '
+            f'(last {len(self._mqtt_debug_log)} events)\n')
+        lines.append(f'Updated: {ts}\n')
+        for entry in self._mqtt_debug_log:
+            lines.append(f'- {entry}')
+        lines.append('')
+        message = '\n'.join(lines)
+        self._persistence_notify(
+            self.__gen_notify_key('mqtt_debug'),
+            'MQTT Gateway Debug',
+            message)
+
+    @final
+    def __show_central_state_changed_notify(
+        self, connected: bool,
+        event_group_id: Optional[str] = None,
+        failover_target: Optional[str] = None
+    ) -> None:
+        nick_name = self._entry_data.get('nick_name', DEFAULT_NICK_NAME)
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+
+        lines: list[str] = []
+        lines.append(
+            f'**{nick_name}({self._uid}, {self._cloud_server})** '
+            f'Central Hub Gateway Debug Report\n')
+        lines.append(f'⏱ {ts}\n')
+
+        # Per-gateway detail
+        all_group_ids: set[str] = set(self._mips_local.keys())
+        for info in self._entry_data.get('home_selected', {}).values():
+            gid = info.get('group_id')
+            if gid:
+                all_group_ids.add(gid)
+
+        for gid in sorted(all_group_ids):
+            mips = self._mips_local.get(gid)
+            home_name = ''
+            for info in self._entry_data.get('home_selected', {}).values():
+                if info.get('group_id') == gid:
+                    home_name = info.get('home_name', '')
+            is_event_gw = (gid == event_group_id)
+            marker = ' ⚡' if is_event_gw else ''
+
+            lines.append(f'---\n### Gateway: {home_name or gid}{marker}\n')
+            lines.append(f'| Field | Value |')
+            lines.append(f'|:---|:---|')
+            lines.append(f'| Group ID | `{gid}` |')
+
+            if mips:
+                state_icon = '🟢' if mips.mips_state else '🔴'
+                state_text = 'Connected' if mips.mips_state else 'Disconnected'
+                lines.append(
+                    f'| Address | `{mips.host}:{mips.port}` |')
+                lines.append(f'| DID | `{mips.client_id}` |')
+                lines.append(
+                    f'| Status | {state_icon} **{state_text}** |')
+
+                if not mips.mips_state and mips.last_disconnect_rc is not None:
+                    rc = mips.last_disconnect_rc
+                    rc_desc = self.MQTT_RC_DESCRIPTIONS.get(
+                        rc, f'Unknown (rc={rc})')
+                    lines.append(
+                        f'| Disconnect RC | `{rc}` — {rc_desc} |')
+                    if mips.reconnect_interval > 0:
+                        lines.append(
+                            f'| Reconnect In | '
+                            f'~{mips.reconnect_interval:.0f}s '
+                            f'(backoff 6→12→24→48→60s max) |')
+            else:
+                lines.append(
+                    f'| Status | ⏳ **Not discovered** (awaiting mDNS) |')
+
+            # Device count through this gateway
+            gw_dev_count = sum(
+                1 for d in self._device_list_gateway.values()
+                if d.get('group_id') == gid)
+            gw_dev_online = sum(
+                1 for d in self._device_list_gateway.values()
+                if d.get('group_id') == gid and d.get('online'))
+            lines.append(
+                f'| Devices | {gw_dev_online} online / {gw_dev_count} total |')
+
+            # Pending failover
+            pending = self._mips_local_pending.get(gid)
+            if pending:
+                lines.append(
+                    f'| Failover Ready | ✅ `{pending["addresses"][0]}'
+                    f':{pending["port"]}` (standby) |')
+            else:
+                lines.append(f'| Failover Ready | — none — |')
+            lines.append('')
+
+        # Event-specific detail
+        if event_group_id and not connected:
+            mips = self._mips_local.get(event_group_id)
+            lines.append('---\n### ⚠️ Disconnect Event Detail\n')
+            if mips and mips.last_disconnect_rc is not None:
+                rc = mips.last_disconnect_rc
+                rc_desc = self.MQTT_RC_DESCRIPTIONS.get(
+                    rc, f'Unknown (rc={rc})')
+                lines.append(f'- **Error**: rc=`{rc}` — {rc_desc}')
+            if failover_target:
+                lines.append(
+                    f'- **Action**: Switching to failover gateway '
+                    f'`{failover_target}`')
+            elif mips:
+                lines.append(
+                    f'- **Action**: Reconnecting to `{mips.host}:{mips.port}`'
+                    f' with exponential backoff')
+            else:
+                lines.append('- **Action**: Awaiting mDNS rediscovery')
+
+        # Device control route summary
+        self.__append_device_route_summary(lines)
+
+        message = '\n'.join(lines)
         self._persistence_notify(
             self.__gen_notify_key('central_state_changed'),
-            self._i18n.translate('miot.client.central_state_changed_title'),
-            self._i18n.translate(key='miot.client.central_state_changed',
-                replace={
-                    'nick_name': self._entry_data.get(
-                                'nick_name', DEFAULT_NICK_NAME),
-                    'uid': self._uid,
-                    'cloud_server': self._cloud_server,
-                    'conn_status': conn_status
-                }))
+            self._i18n.translate(
+                'miot.client.central_state_changed_title'),
+            message)
+
+    @final
+    def __get_device_route(self, did: str) -> str:
+        """Determine the effective control route for a device."""
+        if self._ctrl_mode == CtrlMode.AUTO:
+            device_gw = self._device_list_gateway.get(did, None)
+            if (
+                device_gw and device_gw.get('online', False)
+                and device_gw.get('specv2_access', False)
+                and 'group_id' in device_gw
+            ):
+                mips = self._mips_local.get(device_gw['group_id'], None)
+                if mips and mips.mips_state:
+                    return 'gateway'
+                return 'gateway_offline'
+            device_lan = self._device_list_lan.get(did, None)
+            if device_lan and device_lan.get('online', False):
+                return 'lan'
+        device_cloud = self._device_list_cloud.get(did, None)
+        if device_cloud and device_cloud.get('online', False):
+            return 'cloud'
+        return 'unavailable'
+
+    @final
+    def __append_device_route_summary(self, lines: list[str]) -> None:
+        """Append a per-device control route table to notification lines."""
+        if not self._device_list_cache:
+            return
+        route_icons = {
+            'gateway': '🏠 Central Hub',
+            'gateway_offline': '🏠⚠️ Central Hub (offline)',
+            'lan': '🔌 LAN',
+            'cloud': '☁️ Cloud',
+            'unavailable': '❌ Unavailable',
+        }
+        lines.append('---\n### 📋 Device Control Route\n')
+        lan_fallback_status = (
+            '✅ Enabled' if self._wifi_lan_ctrl_fallback else '❌ Disabled')
+        lines.append(
+            f'WiFi LAN Fallback: **{lan_fallback_status}**\n')
+        lines.append('| Device | Model | Route |')
+        lines.append('|:---|:---|:---|')
+        for did, info in sorted(
+            self._device_list_cache.items(),
+            key=lambda x: x[1].get('name', '')
+        ):
+            name = info.get('name', did)
+            model = info.get('model', '—')
+            route = self.__get_device_route(did)
+            route_text = route_icons.get(route, route)
+            lines.append(f'| {name} | `{model}` | {route_text} |')
+        lines.append('')
 
 @staticmethod
 async def get_miot_instance_async(
