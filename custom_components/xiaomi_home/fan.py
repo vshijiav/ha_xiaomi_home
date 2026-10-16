@@ -92,7 +92,7 @@ async def async_setup_entry(
 class Fan(MIoTServiceEntity, FanEntity):
     """Fan entities for Xiaomi Home."""
     # pylint: disable=unused-argument
-    _prop_on: MIoTSpecProperty
+    _prop_on: Optional[MIoTSpecProperty]
     _prop_fan_level: Optional[MIoTSpecProperty]
     _prop_mode: Optional[MIoTSpecProperty]
     _prop_horizontal_swing: Optional[MIoTSpecProperty]
@@ -117,6 +117,7 @@ class Fan(MIoTServiceEntity, FanEntity):
         self._attr_supported_features = FanEntityFeature(0)
 
         # _prop_on is required
+        self._prop_on = None
         self._prop_fan_level = None
         self._prop_mode = None
         self._prop_horizontal_swing = None
@@ -136,7 +137,8 @@ class Fan(MIoTServiceEntity, FanEntity):
             if prop.name == 'on':
                 self._attr_supported_features |= FanEntityFeature.TURN_ON
                 self._attr_supported_features |= FanEntityFeature.TURN_OFF
-                self._prop_on = prop
+                if self._prop_on is None or prop.iid < self._prop_on.iid:
+                    self._prop_on = prop
             elif prop.name == 'fan-level':
                 if prop.value_range:
                     # Fan level with value-range
