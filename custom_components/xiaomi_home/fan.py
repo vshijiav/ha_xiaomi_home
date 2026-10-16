@@ -176,15 +176,20 @@ class Fan(MIoTServiceEntity, FanEntity):
                 self._attr_supported_features |= FanEntityFeature.OSCILLATE
                 self._prop_horizontal_swing = prop
             elif prop.name == 'wind-reverse':
-                if prop.format_ == bool:
-                    self._prop_wind_reverse_forward = False
-                    self._prop_wind_reverse_reverse = True
-                elif prop.value_list:
+                # A value-list (e.g. set in spec_modify.yaml) is prior to the
+                # default bool meaning, some devices use True for forward.
+                if prop.value_list:
                     for item in prop.value_list.items:
                         if item.name in {'foreward', 'forward'}:
                             self._prop_wind_reverse_forward = item.value
                         elif item.name in {'reversal', 'reverse'}:
                             self._prop_wind_reverse_reverse = item.value
+                if prop.format_ == bool and (
+                    self._prop_wind_reverse_forward is None
+                    or self._prop_wind_reverse_reverse is None
+                ):
+                    self._prop_wind_reverse_forward = False
+                    self._prop_wind_reverse_reverse = True
                 if (
                     self._prop_wind_reverse_forward is None
                     or self._prop_wind_reverse_reverse is None

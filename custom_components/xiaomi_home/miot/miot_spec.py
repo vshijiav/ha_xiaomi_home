@@ -1498,6 +1498,7 @@ class MIoTSpecParser:
                 # Modify value-list before translation
                 v_list: list[dict] = self._spec_modify.get_prop_value_list(
                     siid=service['iid'], piid=property_['iid'])
+                v_list_modified: bool = v_list is not None
                 if (v_list is None) and ('value-list' in property_):
                     v_list = property_['value-list']
                 if v_list is not None:
@@ -1513,7 +1514,8 @@ class MIoTSpecParser:
                     spec_prop.value_list = MIoTSpecValueList.from_spec(v_list)
                 if 'value-range' in property_:
                     spec_prop.value_range = property_['value-range']
-                elif property_['format'] == 'bool':
+                elif property_['format'] == 'bool' and not v_list_modified:
+                    # Keep the value-list set in spec_modify.yaml
                     v_tag = ':'.join(p_type_strs[:5])
                     v_descriptions = (await
                                       self._bool_trans.translate_async(urn=v_tag

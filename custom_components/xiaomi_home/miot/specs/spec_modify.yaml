@@ -387,6 +387,13 @@ urn:miot-spec-v2:device:light:0000A001:shhf-sfla10:1:
   prop.8.9:
     name: wind-reverse
 urn:miot-spec-v2:device:light:0000A001:shhf-sfla12:1:
+  prop.8.9:
+    name: wind-reverse
+    value-list:
+    - value: true
+      description: forward
+    - value: false
+      description: reverse
   prop.8.11:
     name: on-a
 urn:miot-spec-v2:device:light:0000A001:shhf-sflt11:1:0000C802:
