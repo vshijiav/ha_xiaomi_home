@@ -259,8 +259,6 @@ class MIoTClient:
             'display_binary_mode', ['text'])
         self._display_binary_bool = 'bool' in entry_data.get(
             'display_binary_mode', ['text'])
-        self._wifi_lan_ctrl_fallback = entry_data.get(
-            'wifi_lan_ctrl_fallback', False)
 
         self._mqtt_debug_log: list[str] = []
         self._mqtt_debug_max_entries: int = 0
@@ -381,9 +379,6 @@ class MIoTClient:
                         handler=self.__on_mips_local_state_changed)
                     mips.connect()
             # Lan ctrl
-            if self._wifi_lan_ctrl_fallback:
-                await self._miot_lan.set_allow_central_hub_coexist(
-                    key=f'{self._uid}-{self._cloud_server}', allow=True)
             await self._miot_lan.vote_for_lan_ctrl_async(
                 key=f'{self._uid}-{self._cloud_server}', vote=True)
             self._miot_lan.sub_lan_state(
@@ -459,8 +454,6 @@ class MIoTClient:
                     devices=list(self._device_list_cache.keys()))
             await self._miot_lan.vote_for_lan_ctrl_async(
                 key=f'{self._uid}-{self._cloud_server}', vote=False)
-            await self._miot_lan.set_allow_central_hub_coexist(
-                key=f'{self._uid}-{self._cloud_server}', allow=False)
         # Cancel refresh auth info
         if self._refresh_token_timer:
             self._refresh_token_timer.cancel()
@@ -2359,10 +2352,6 @@ class MIoTClient:
             'unavailable': '❌ Unavailable',
         }
         lines.append('---\n### 📋 Device Control Route\n')
-        lan_fallback_status = (
-            '✅ Enabled' if self._wifi_lan_ctrl_fallback else '❌ Disabled')
-        lines.append(
-            f'WiFi LAN Fallback: **{lan_fallback_status}**\n')
         lines.append('| Device | Model | Route |')
         lines.append('|:---|:---|:---|')
         for did, info in sorted(
