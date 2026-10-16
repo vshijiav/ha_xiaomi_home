@@ -1077,8 +1077,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             'display_binary_mode', ['text'])
         self._display_devs_notify = self._entry_data.get(
             'display_devices_changed_notify', ['add', 'del', 'offline'])
-        self._wifi_lan_ctrl_fallback = self._entry_data.get(
-            'wifi_lan_ctrl_fallback', False)
         self._home_selected_list = list(
             self._entry_data['home_selected'].keys())
         self._devices_filter = self._entry_data.get('devices_filter', {})
@@ -1097,7 +1095,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         self._hide_non_standard_entities_new = False
         self._display_binary_mode_new = []
         self._cover_width_new = self._cover_dz_width
-        self._wifi_lan_ctrl_fallback_new = self._wifi_lan_ctrl_fallback
         self._update_user_info = False
         self._update_devices = False
         self._update_trans_rules = False
@@ -1359,10 +1356,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         'update_lan_ctrl_config',
                         default=self._opt_lan_ctrl_cfg  # type: ignore
                     ): bool,
-                    vol.Required(
-                        'wifi_lan_ctrl_fallback',
-                        default=self._wifi_lan_ctrl_fallback  # type: ignore
-                    ): bool,
                     # Entity info configure
                     vol.Required(
                         'action_debug',
@@ -1420,8 +1413,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             'update_trans_rules', self._update_trans_rules)
         self._opt_lan_ctrl_cfg = user_input.get(
             'update_lan_ctrl_config', self._opt_lan_ctrl_cfg)
-        self._wifi_lan_ctrl_fallback_new = user_input.get(
-            'wifi_lan_ctrl_fallback', self._wifi_lan_ctrl_fallback)
         self._opt_network_detect_cfg = user_input.get(
             'network_detect_config', self._opt_network_detect_cfg)
         self._cover_width_new = user_input.get(
@@ -1998,10 +1989,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         if key in trans_devs_display)
                         if self._display_devs_notify
                         else self._miot_i18n.translate(
-                            key='config.other.no_display')),
-                    'wifi_lan_ctrl_fallback': (
-                        enable_text if self._wifi_lan_ctrl_fallback_new
-                        else disable_text),
+                            key='config.other.no_display'))
                 },  # type: ignore
                 errors={'base': 'not_confirm'} if user_input else {},
                 last_step=True
@@ -2045,10 +2033,6 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
         if set(self._display_binary_mode) != set(self._display_binary_mode_new):
             self._entry_data['display_binary_mode'] = (
                 self._display_binary_mode_new)
-            self._need_reload = True
-        if self._wifi_lan_ctrl_fallback_new != self._wifi_lan_ctrl_fallback:
-            self._entry_data['wifi_lan_ctrl_fallback'] = (
-                self._wifi_lan_ctrl_fallback_new)
             self._need_reload = True
         # Update display_devices_changed_notify
         self._entry_data['display_devices_changed_notify'] = (
