@@ -53,6 +53,7 @@ import re
 import ssl
 import struct
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -294,6 +295,7 @@ class _MipsClient(ABC):
         self._mips_state_sub_map_lock = threading.Lock()
         self._mips_sub_pending_map = {}
         self._mips_sub_pending_timer = None
+        self._last_disconnect_rc: Optional[int] = None
         # DO NOT start the thread yet. Do that on connect
 
     @property
@@ -307,6 +309,14 @@ class _MipsClient(ABC):
     @property
     def port(self) -> int:
         return self._port
+
+    @property
+    def last_disconnect_rc(self) -> Optional[int]:
+        return self._last_disconnect_rc
+
+    @property
+    def reconnect_interval(self) -> float:
+        return self._mips_reconnect_interval
 
     @final
     @property
@@ -678,6 +688,7 @@ class _MipsClient(ABC):
         if self._mqtt_state:
             (self.log_info if rc == 0 else self.log_error)(
                 f'mips disconnect, {rc}, {props}')
+            self._last_disconnect_rc = rc
             self._mqtt_state = False
             if self._mqtt_timer:
                 self._mqtt_timer.cancel()
@@ -1148,6 +1159,7 @@ class MipsLocalClient(_MipsClient):
         self._get_prop_queue = {}
         self._get_prop_timer = None
         self._on_dev_list_changed = None
+        self._on_mqtt_debug: Optional[Callable[[str, str], None]] = None
 
         super().__init__(
             client_id=did, host=host, port=port,
@@ -1156,6 +1168,30 @@ class MipsLocalClient(_MipsClient):
     @property
     def group_id(self) -> str:
         return self._group_id
+
+    @property
+    def home_name(self) -> str:
+        return self._home_name
+
+    @property
+    def on_mqtt_debug(self) -> Optional[Callable[[str, str], None]]:
+        return self._on_mqtt_debug
+
+    @on_mqtt_debug.setter
+    def on_mqtt_debug(self, handler: Optional[Callable[[str, str], None]]):
+        self._on_mqtt_debug = handler
+
+    def _emit_debug(self, direction: str, detail: str) -> None:
+        handler = self._on_mqtt_debug
+        if not handler:
+            return
+        try:
+            ts = time.strftime('%H:%M:%S')
+            msg = f'`{ts}` **{direction}** {detail}'
+            self.main_loop.call_soon_threadsafe(
+                handler, self._group_id, msg)
+        except RuntimeError:
+            pass
 
     def log_debug(self, msg, *args, **kwargs) -> None:
         if self._logger:
@@ -1176,6 +1212,9 @@ class MipsLocalClient(_MipsClient):
 
     @final
     def disconnect(self) -> None:
+        self._emit_debug(
+            '🔌 DISCONNECT_REQ',
+            f'host=`{self._host}:{self._port}` initiating disconnect...')
         super().disconnect()
         self._request_map = {}
         self._msg_matcher = MIoTMatcher()
@@ -1293,6 +1332,9 @@ class MipsLocalClient(_MipsClient):
     async def get_prop_async(
         self, did: str, siid: int, piid: int, timeout_ms: int = 10000
     ) -> Any:
+        self._emit_debug(
+            '🔍 GET_PROP',
+            f'did=`{did}` siid=`{siid}` piid=`{piid}`')
         result_obj = await self.__request_async(
             topic='proxy/get',
             payload=json.dumps({
@@ -1302,7 +1344,15 @@ class MipsLocalClient(_MipsClient):
             }),
             timeout_ms=timeout_ms)
         if not isinstance(result_obj, dict) or 'value' not in result_obj:
+            self._emit_debug(
+                '❌ GET_PROP FAIL',
+                f'did=`{did}` siid=`{siid}` piid=`{piid}` '
+                f'result=`{result_obj}`')
             return None
+        self._emit_debug(
+            '✅ GET_PROP OK',
+            f'did=`{did}` siid=`{siid}` piid=`{piid}` '
+            f'value=`{result_obj["value"]}`')
         return result_obj['value']
 
     @final
@@ -1310,6 +1360,10 @@ class MipsLocalClient(_MipsClient):
         self, did: str, siid: int, piid: int, value: Any,
         timeout_ms: int = 10000
     ) -> dict:
+        self._emit_debug(
+            '✏️ SET_PROP',
+            f'did=`{did}` siid=`{siid}` piid=`{piid}` '
+            f'value=`{value}`')
         payload_obj: dict = {
             'did': did,
             'rpc': {
@@ -1335,9 +1389,21 @@ class MipsLocalClient(_MipsClient):
                 and result_obj['result'][0]['did'] == did
                 and 'code' in result_obj['result'][0]
             ):
+                self._emit_debug(
+                    '✅ SET_PROP OK',
+                    f'did=`{did}` siid=`{siid}` piid=`{piid}` '
+                    f'code=`{result_obj["result"][0]["code"]}`')
                 return result_obj['result'][0]
             if 'error' in result_obj:
+                self._emit_debug(
+                    '❌ SET_PROP ERR',
+                    f'did=`{did}` siid=`{siid}` piid=`{piid}` '
+                    f'error=`{result_obj["error"]}`')
                 return result_obj['error']
+        self._emit_debug(
+            '❌ SET_PROP FAIL',
+            f'did=`{did}` siid=`{siid}` piid=`{piid}` '
+            f'result=`{result_obj}`')
         return {
             'code': MIoTErrorCode.CODE_INTERNAL_ERROR.value,
             'message': 'Invalid result'}
@@ -1347,6 +1413,10 @@ class MipsLocalClient(_MipsClient):
         self, did: str, siid: int, aiid: int, in_list: list,
         timeout_ms: int = 10000
     ) -> dict:
+        self._emit_debug(
+            '⚡ ACTION',
+            f'did=`{did}` siid=`{siid}` aiid=`{aiid}` '
+            f'in=`{in_list}`')
         payload_obj: dict = {
             'did': did,
             'rpc': {
@@ -1365,9 +1435,21 @@ class MipsLocalClient(_MipsClient):
             timeout_ms=timeout_ms)
         if result_obj:
             if 'result' in result_obj and 'code' in result_obj['result']:
+                self._emit_debug(
+                    '✅ ACTION OK',
+                    f'did=`{did}` siid=`{siid}` aiid=`{aiid}` '
+                    f'code=`{result_obj["result"]["code"]}`')
                 return result_obj['result']
             if 'error' in result_obj:
+                self._emit_debug(
+                    '❌ ACTION ERR',
+                    f'did=`{did}` siid=`{siid}` aiid=`{aiid}` '
+                    f'error=`{result_obj["error"]}`')
                 return result_obj['error']
+        self._emit_debug(
+            '❌ ACTION FAIL',
+            f'did=`{did}` siid=`{siid}` aiid=`{aiid}` '
+            f'result=`{result_obj}`')
         return {
             'code': MIoTErrorCode.CODE_INTERNAL_ERROR.value,
             'message': 'Invalid result'}
@@ -1380,7 +1462,17 @@ class MipsLocalClient(_MipsClient):
             topic='proxy/getDevList', payload=payload or '{}',
             timeout_ms=timeout_ms)
         if not result_obj or 'devList' not in result_obj:
+            self._emit_debug(
+                '❌ getDevList FAILED',
+                f'result=`{result_obj}` — no devList key')
             raise MIoTMipsError('invalid result')
+        dev_count = len(result_obj['devList'])
+        online_count = sum(
+            1 for v in result_obj['devList'].values()
+            if v.get('online', False))
+        self._emit_debug(
+            '✅ getDevList OK',
+            f'{online_count} online / {dev_count} total devices')
         device_list = {}
         for did, info in result_obj['devList'].items():
             name: str = info.get('name', None)
@@ -1461,12 +1553,22 @@ class MipsLocalClient(_MipsClient):
         self.log_debug(
             f'mips local call api, {result}, {req.mid}, {pub_topic}, '
             f'{payload}')
+        self._emit_debug(
+            '📤 PUB',
+            f'topic=`{pub_topic}` mid=`{req.mid}` '
+            f'timeout={timeout_ms}ms\n'
+            f'  payload: `{payload}`')
 
         def on_request_timeout(req: _MipsRequest):
             self.log_error(
                 f'on mips request timeout, {req.mid}, {pub_topic}'
                 f', {payload}')
             self._request_map.pop(str(req.mid), None)
+            self._emit_debug(
+                '⏰ TIMEOUT',
+                f'mid=`{req.mid}` topic=`{pub_topic}` '
+                f'after {timeout_ms}ms\n'
+                f'  original payload: `{payload}`')
             req.on_reply(
                 '{"error":{"code":-10006, "message":"timeout"}}',
                 req.on_reply_ctx)
@@ -1499,45 +1601,71 @@ class MipsLocalClient(_MipsClient):
     @final
     def _on_mips_connect(self, rc: int, props: dict) -> None:
         self.log_debug('__on_mips_connect_handler')
+        self._emit_debug(
+            '🟢 CONNECT',
+            f'rc=`{rc}` host=`{self._host}:{self._port}` '
+            f'did=`{self._did}`')
         # Sub did/#, include reply topic
         self._mips_sub_internal(f'{self._did}/#')
+        self._emit_debug('📥 SUB', f'topic=`{self._did}/#`')
         # Sub device list change
         self._mips_sub_internal('master/appMsg/devListChange')
+        self._emit_debug('📥 SUB', f'topic=`master/appMsg/devListChange`')
         # Do not need to subscribe api topics, for they are covered by did/#
         # Sub api topic.
         # Sub broadcast topic
         for topic, _ in list(self._msg_matcher.iter_all_nodes()):
-            self._mips_sub_internal(
-                topic=re.sub(f'^{self._did}', 'master', topic))
+            sub_topic = re.sub(f'^{self._did}', 'master', topic)
+            self._mips_sub_internal(topic=sub_topic)
+            self._emit_debug('📥 SUB', f'topic=`{sub_topic}` (broadcast)')
 
     @final
     def _on_mips_disconnect(self, rc: int, props: dict) -> None:
-        pass
+        self._emit_debug(
+            '🔴 DISCONNECT',
+            f'rc=`{rc}` host=`{self._host}:{self._port}`')
 
     @final
     def _on_mips_message(self, topic: str, payload: bytes) -> None:
         mips_msg: _MipsMessage = _MipsMessage.unpack(payload)
-        # self.log_debug(
-        #     f"mips local client, on_message, {topic} -> {mips_msg}")
         # Reply
         if topic == self._reply_topic:
             self.log_debug(f'on request reply, {mips_msg}')
+            payload_preview = mips_msg.payload or '{}'
+            if len(payload_preview) > 500:
+                payload_preview = payload_preview[:500] + '...(truncated)'
+            self._emit_debug(
+                '📨 REPLY',
+                f'mid=`{mips_msg.mid}` '
+                f'({len(payload)} bytes raw)\n'
+                f'  payload: `{payload_preview}`')
             req: Optional[_MipsRequest] = self._request_map.pop(
                 str(mips_msg.mid), None)
             if req:
-                # Cancel timer
                 if req.timer:
                     req.timer.cancel()
                 if req.on_reply:
                     self.main_loop.call_soon_threadsafe(
                         req.on_reply, mips_msg.payload or '{}',
                         req.on_reply_ctx)
+            else:
+                self._emit_debug(
+                    '⚠️ REPLY',
+                    f'mid=`{mips_msg.mid}` has no matching request '
+                    f'(orphan/late reply)')
             return
         # Broadcast
         bc_list: list[_MipsBroadcast] = list(self._msg_matcher.iter_match(
             topic=topic))
         if bc_list:
             self.log_debug(f'on broadcast, {topic}, {mips_msg}')
+            payload_preview = mips_msg.payload or '{}'
+            if len(payload_preview) > 300:
+                payload_preview = payload_preview[:300] + '...(truncated)'
+            self._emit_debug(
+                '📢 BROADCAST',
+                f'topic=`{topic}`\n'
+                f'  payload: `{payload_preview}`')
             for item in bc_list or []:
                 if item.handler is None:
                     continue
@@ -1547,6 +1675,10 @@ class MipsLocalClient(_MipsClient):
             return
         # Device list change
         if topic == self._dev_list_change_topic:
+            self._emit_debug(
+                '📋 DEV_LIST_CHANGE',
+                f'topic=`{topic}`\n'
+                f'  payload: `{mips_msg.payload}`')
             if mips_msg.payload is None:
                 self.log_error('devListChange msg is None')
                 return
@@ -1562,6 +1694,10 @@ class MipsLocalClient(_MipsClient):
                     self._on_dev_list_changed(self, dev_list))
             return
 
+        self._emit_debug(
+            '❓ UNKNOWN',
+            f'topic=`{topic}` mid=`{mips_msg.mid}`\n'
+            f'  payload: `{mips_msg.payload}`')
         self.log_debug(
             f'mips local client, recv unknown msg, {topic} -> {mips_msg}')
 
